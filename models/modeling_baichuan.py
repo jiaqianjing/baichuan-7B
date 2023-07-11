@@ -114,6 +114,9 @@ class RotaryEmbedding(torch.nn.Module):
         t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype) # [4096]
         freqs = torch.einsum("i,j->ij", t, self.inv_freq) # [4096, 64]
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        # raw paper: cos = [cosm\theta_1, cosm\theta_1, cosm\theta_2, cosm\theta_2,...]
+        # here:      cos = [cosm\theta_1, cosm\theta_2,...,cosm\theta_1,cosm\theta_2,...]
+        # 但是最终 q_emb, k_emb 的计算结果保持一致
         emb = torch.cat((freqs, freqs), dim=-1) # [4096, 128]
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False) # [1, 1, 4096, 128]
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False) # [1, 1, 4096, 128]
@@ -130,8 +133,8 @@ class RotaryEmbedding(torch.nn.Module):
             self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False) # [1, 1, seq_len, 128]
             self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False) # [1, 1, seq_len, 128]
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, M, 128]
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, M, 128]
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, seq_len, 128]
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, seq_len, 128]
         )
 
 
@@ -144,12 +147,13 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    # q: [bs, 32, seq_len, 128], k: [bs, 32, seq_len, 128]
     cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = (q * cos) + (rotate_half(q) * sin) # [bs, 32, seq_len, dim]
+    k_embed = (k * cos) + (rotate_half(k) * sin) # [bs, 32, seq_len, dim]
     return q_embed, k_embed
 
 
@@ -203,28 +207,33 @@ class Attention(nn.Module):
             output_attentions: bool = False,
             use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+        bsz, q_len, _ = hidden_states.size() # [bs, seq_len, 4096]
 
-        proj = self.W_pack(hidden_states) # [N, 4096 * 3]
-        proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2) # [3, N, 4096]
+        proj = self.W_pack(hidden_states) # [bs, seq_len, 4096 * 3]
+        proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2) # [3, bs, seq_len, 4096]
 
         if self.training:  # for training
-            query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim)
+            query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2) # [bs, 32, seq_len, 128]
+            key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)   # [bs, 32, seq_len, 128]
+            value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim)                 # [bs, seq_len, 32, 128]
 
-            kv_seq_len = key_states.shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            kv_seq_len = key_states.shape[-2] # seq_len
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) #([1, 1, seq_len, 128], [1, 1, seq_len, 128])
+            # # ([bs, 32, seq_len, 128], [bs, 32, seq_len, 128)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
+            query_states = query_states.transpose(1, 2) # [bs, seq_len, 32, 128]
+            key_states = key_states.transpose(1, 2) # [bs, seq_len, 32, 128]
 
+            # [bs, seq_len, 32, 128]
             attn_output = xops.memory_efficient_attention(
                 query_states, key_states, value_states,
                 attn_bias=xops.LowerTriangularMask()
             )
+
+            # [bs, seq_len, 4096]
             attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+            # [bs, seq_len, 4096]
             attn_output = self.o_proj(attn_output)
             return attn_output, None, None
 
@@ -323,9 +332,9 @@ class DecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,            # [N, M, 4096]
-            attention_mask=attention_mask,          # [N, 1, M, M]
-            position_ids=position_ids,              # [1, M]
+            hidden_states=hidden_states,            # [bs, seq_len, 4096]
+            attention_mask=attention_mask,          # [bs, 1, seq_len, seq_len]
+            position_ids=position_ids,              # [1, seq_len]
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -511,9 +520,9 @@ class Model(PreTrainedModel):
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
-                    hidden_states, # [N, M, 4096]
-                    attention_mask, # [N, 1, M, M]
-                    position_ids,  # [1, M]
+                    hidden_states, # [bs, seq_len, 4096]
+                    attention_mask, # [bs, 1, seq_len, M]
+                    position_ids,  # [1, seq_len]
                     None,
                 )
             else:
