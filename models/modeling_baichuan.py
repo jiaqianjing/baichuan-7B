@@ -106,17 +106,17 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(torch.nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim))
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float().to(device) / dim)) # [64]
         self.register_buffer("inv_freq", inv_freq)
 
         # Build here to make `torch.jit.trace` work.
         self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype) # [4096]
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq) # [4096, 64]
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+        emb = torch.cat((freqs, freqs), dim=-1) # [4096, 128]
+        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False) # [1, 1, 4096, 128]
+        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False) # [1, 1, 4096, 128]
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
@@ -127,11 +127,11 @@ class RotaryEmbedding(torch.nn.Module):
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
             # Different from paper, but it uses a different permutation in order to obtain the same calculation
             emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-            self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-            self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
+            self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False) # [1, 1, seq_len, 128]
+            self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False) # [1, 1, seq_len, 128]
         return (
-            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
-            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, M, 128]
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype), # [1, 1, M, 128]
         )
 
 
@@ -176,18 +176,18 @@ class Attention(nn.Module):
     def __init__(self, config: BaiChuanConfig):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
-        self.max_position_embeddings = config.max_position_embeddings
+        self.hidden_size = config.hidden_size  # 4096
+        self.num_heads = config.num_attention_heads  # 32
+        self.head_dim = self.hidden_size // self.num_heads # 128
+        self.max_position_embeddings = config.max_position_embeddings # 4096
 
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(
                 f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
                 f" and `num_heads`: {self.num_heads})."
             )
-        self.W_pack = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.W_pack = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False) # [4096, 4096*3]
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False) # [4096, 4096]
         self.rotary_emb = RotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
         self.cos, self.sin = None, None
 
@@ -205,8 +205,8 @@ class Attention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        proj = self.W_pack(hidden_states)
-        proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2)
+        proj = self.W_pack(hidden_states) # [N, 4096 * 3]
+        proj = proj.unflatten(-1, (3, self.hidden_size)).unsqueeze(0).transpose(0, -2).squeeze(-2) # [3, N, 4096]
 
         if self.training:  # for training
             query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -318,13 +318,14 @@ class DecoderLayer(nn.Module):
 
         residual = hidden_states
 
+        # Pre Norm
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            hidden_states=hidden_states,            # [N, M, 4096]
+            attention_mask=attention_mask,          # [N, 1, M, M]
+            position_ids=position_ids,              # [1, M]
             past_key_value=past_key_value,
             output_attentions=output_attentions,
             use_cache=use_cache,
@@ -510,9 +511,9 @@ class Model(PreTrainedModel):
 
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
+                    hidden_states, # [N, M, 4096]
+                    attention_mask, # [N, 1, M, M]
+                    position_ids,  # [1, M]
                     None,
                 )
             else:
