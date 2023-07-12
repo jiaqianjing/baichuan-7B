@@ -218,7 +218,7 @@ class Attention(nn.Module):
             value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim)                 # [bs, seq_len, 32, 128]
 
             kv_seq_len = key_states.shape[-2] # seq_len
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) #([1, 1, seq_len, 128], [1, 1, seq_len, 128])
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len) # ([1, 1, seq_len, 128], [1, 1, seq_len, 128])
             # # ([bs, 32, seq_len, 128], [bs, 32, seq_len, 128)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -238,14 +238,15 @@ class Attention(nn.Module):
             return attn_output, None, None
 
         else:  # for inference
-            query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-            value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+            query_states = proj[0].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2) # [bs, 32, seq_len, 128]
+            key_states = proj[1].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)   # [bs, 32, seq_len, 128]
+            value_states = proj[2].view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2) # [bs, 32, seq_len, 128]
 
-            kv_seq_len = key_states.shape[-2]
+            kv_seq_len = key_states.shape[-2] # seq_len
             if past_key_value is not None:
                 kv_seq_len += past_key_value[0].shape[-2]
-            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+            cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)  # ([1, 1, seq_len, 128], [1, 1, seq_len, 128])
+            # ([bs, 32, seq_len, 128], [bs, 32, seq_len, 128)
             query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
             if past_key_value is not None:
@@ -253,6 +254,7 @@ class Attention(nn.Module):
                 value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
             past_key_value = (key_states, value_states) if use_cache else None
+            # [bs, 32, seq_len, seq_len],  QK^T/√d_k
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
             if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
@@ -260,18 +262,23 @@ class Attention(nn.Module):
                     f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                     f" {attn_weights.size()}"
                 )
-
+            # [bs, 1, seq_len, seq_len]] 下三角全为 0，上三角全为负无穷，使得每个 token 仅能关注到它自身以及前面的 token 注意力
+            # [[0, -inf, -inf, -inf],
+            #  [0,    0, -inf, -inf],
+            #  [0,    0,    0, -inf]
+            #  [0,    0,    0,    0]]
             if attention_mask is not None:
                 if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                     raise ValueError(
                         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                     )
+                # [bs, 32, seq_len, seq_len],  MASK(QK^T/√d_k)
                 attn_weights = attn_weights + attention_mask
                 attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
-            # upcast attention to fp32
+            # upcast attention to fp32, [bs, 32, seq_len, seq_len]
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = torch.matmul(attn_weights, value_states) # [bs, 32, seq_len, 128]
 
             if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
                 raise ValueError(
@@ -279,9 +286,9 @@ class Attention(nn.Module):
                     f" {attn_output.size()}"
                 )
 
-            attn_output = attn_output.transpose(1, 2)
-            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-            attn_output = self.o_proj(attn_output)
+            attn_output = attn_output.transpose(1, 2) # [bs, seq_len, 32, 128]
+            attn_output = attn_output.reshape(bsz, q_len, self.hidden_size) # [bs, seq_len, 4096]
+            attn_output = self.o_proj(attn_output) # [bs, seq_len, 4096]
 
             if not output_attentions:
                 attn_weights = None
@@ -331,6 +338,11 @@ class DecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
+        # training： return hidden_states, None, None
+        # inference: return hidden_states, self_attn_weights if output_attentions else None,  present_key_value if use_cache else None
+        # hidden_states: [bs, seq_len, 4096]
+        # self_attn_weights: [bs, 32, seq_len, seq_len]
+        # present_key_value: ([bs, 32, seq_len, 128], [bs, 32, seq_len, 128)
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,            # [bs, seq_len, 4096]
             attention_mask=attention_mask,          # [bs, 1, seq_len, seq_len]
@@ -339,13 +351,13 @@ class DecoderLayer(nn.Module):
             output_attentions=output_attentions,
             use_cache=use_cache,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states # [bs, seq_len, 4096]
 
         # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        residual = hidden_states # [bs, seq_len, 4096]
+        hidden_states = self.post_attention_layernorm(hidden_states) # [bs, seq_len, 4096]
+        hidden_states = self.mlp(hidden_states) # [bs, seq_len, 4096]
+        hidden_states = residual + hidden_states # [bs, seq_len, 4096]
 
         outputs = (hidden_states,)
 
@@ -517,7 +529,7 @@ class Model(PreTrainedModel):
                         return module(*inputs, output_attentions, None)
 
                     return custom_forward
-
+                # (hidden_states, None, None)
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states, # [bs, seq_len, 4096]
@@ -526,6 +538,14 @@ class Model(PreTrainedModel):
                     None,
                 )
             else:
+                # inference: 
+                #           hidden_states, 
+                #           self_attn_weights if output_attentions else None,  
+                #           present_key_value if use_cache else None
+                # hidden_states: [bs, seq_len, 4096]
+                # self_attn_weights: [bs, 32, seq_len, seq_len]
+                # present_key_value: ([bs, 32, seq_len, 128], [bs, 32, seq_len, 128])
+                # (hidden_states, self_attn_weights, present_key_value)
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=attention_mask,
@@ -538,16 +558,16 @@ class Model(PreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],) # (([bs, 32, seq_len, 128], [bs, 32, seq_len, 128]),)
 
             if output_attentions:
-                all_self_attns += (layer_outputs[1],)
+                all_self_attns += (layer_outputs[1],) # ([bs, 32, seq_len, seq_len],)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states) # [bs, seq_len, 4096]
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (hidden_states,)
+            all_hidden_states += (hidden_states,) # ([bs, seq_len, 4096],)
 
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
