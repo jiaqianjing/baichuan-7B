@@ -533,7 +533,7 @@ class Model(PreTrainedModel):
                 layer_outputs = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(decoder_layer),
                     hidden_states, # [bs, seq_len, 4096]
-                    attention_mask, # [bs, 1, seq_len, M]
+                    attention_mask, # [bs, 1, seq_len, seq_len]
                     position_ids,  # [1, seq_len]
                     None,
                 )
@@ -666,18 +666,18 @@ class BaiChuanForCausalLM(PreTrainedModel):
             return_dict=return_dict,
         )
 
-        hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
+        hidden_states = outputs[0] # [bs, seq_len, 4096]
+        logits = self.lm_head(hidden_states) # [bs, seq_len, 64000]
 
         loss = None
-        if labels is not None:
+        if labels is not None:  # [bs, seq_len]
             # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_logits = logits[..., :-1, :].contiguous()  # [bs, seq_len-1, 64000]
+            shift_labels = labels[..., 1:].contiguous()      # [bs, seq_len-1]
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
+            shift_logits = shift_logits.view(-1, self.config.vocab_size) # [bs+seq_len-1, 64000]
+            shift_labels = shift_labels.view(-1)                         # [bs+seq_len-1]
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
